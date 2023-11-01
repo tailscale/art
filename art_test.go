@@ -6,12 +6,10 @@ package art
 import (
 	"os"
 	"testing"
-
-	"tailscale.com/util/cibuild"
 )
 
 func TestMain(m *testing.M) {
-	if cibuild.On() {
+	if os.Getenv("GITHUB_ACTIONS") != "" || os.Getenv("CI") == "true" {
 		// Skip CI on GitHub for now
 		// TODO: https://github.com/tailscale/tailscale/issues/7866
 		os.Exit(0)
