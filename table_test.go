@@ -846,6 +846,27 @@ func TestDeleteIsReverseOfInsert(t *testing.T) {
 	}
 }
 
+func TestOverlapsPrefixCompare(t *testing.T) {
+	t.Parallel()
+	pfxs := randomPrefixes(10_000)
+
+	slow := slowPrefixTable[int]{pfxs}
+	fast := Table[int]{}
+
+	for _, pfx := range pfxs {
+		fast.Insert(pfx.pfx, pfx.val)
+	}
+
+	tests := randomPrefixes(10_000)
+	for _, tt := range tests {
+		gotSlow := slow.overlapsPrefix(tt.pfx)
+		gotFast := fast.OverlapsPrefix(tt.pfx)
+		if gotSlow != gotFast {
+			t.Fatalf("overlapsPrefix(%q) = %v, want %v", tt.pfx, gotFast, gotSlow)
+		}
+	}
+}
+
 type tableTest struct {
 	// addr is an IP address string to look up in a route table.
 	addr string
@@ -1014,6 +1035,40 @@ func BenchmarkTableGet(b *testing.B) {
 	})
 }
 
+var boolSink bool
+
+func BenchmarkTableOverlapsPrefix(b *testing.B) {
+	forFamilyAndCount(b, func(b *testing.B, routes []slowPrefixEntry[int]) {
+		var rt Table[int]
+		for _, route := range routes {
+			rt.Insert(route.pfx, route.val)
+		}
+
+		genPfxs := randomPrefixes4
+		if routes[0].pfx.Addr().Is6() {
+			genPfxs = randomPrefixes6
+		}
+		const count = 10_000
+		pfxs := genPfxs(count)
+		b.ResetTimer()
+		allocs, bytes := getMemCost(func() {
+			for i := 0; i < b.N; i++ {
+				boolSink = rt.OverlapsPrefix(pfxs[i%count].pfx)
+			}
+		})
+		b.StopTimer()
+
+		b.ReportAllocs() // Enables the output, but we report manually below
+		lookups := float64(b.N)
+		elapsed := float64(b.Elapsed().Nanoseconds())
+		elapsedSec := float64(b.Elapsed().Seconds())
+		b.ReportMetric(elapsed/lookups, "ns/op")
+		b.ReportMetric(lookups/elapsedSec, "addrs/s")
+		b.ReportMetric(allocs/lookups, "allocs/op")
+		b.ReportMetric(bytes/lookups, "B/op")
+	})
+}
+
 // getMemCost runs fn 100 times and returns the number of allocations and bytes
 // allocated by each call to fn.
 //
@@ -1139,6 +1194,15 @@ func (t *slowPrefixTable[T]) get(addr netip.Addr) (ret T, ok bool) {
 		}
 	}
 	return ret, bestLen != -1
+}
+
+func (t *slowPrefixTable[T]) overlapsPrefix(pfx netip.Prefix) bool {
+	for _, p := range t.prefixes {
+		if p.pfx.Overlaps(pfx) {
+			return true
+		}
+	}
+	return false
 }
 
 // randomPrefixes returns n randomly generated prefixes and associated values,

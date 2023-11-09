@@ -223,6 +223,17 @@ func (t *strideTable[T]) getValAndChild(addr uint8) (val T, valOK bool, child *s
 	return
 }
 
+// overlapsPrefix reports whether the route addr/prefixLen overlaps
+// with any prefix in t.
+func (t *strideTable[T]) overlapsPrefix(addr uint8, prefixLen int) bool {
+	for idx, last := hostIndex(addr), lastHostIndexOfPrefix(addr, prefixLen); idx <= last; idx++ {
+		if t.entries[idx] != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // TableDebugString returns the contents of t, formatted as a table with one
 // line per entry.
 func (t *strideTable[T]) tableDebugString() string {
@@ -285,6 +296,24 @@ func parentIndex(idx int) int {
 // It is equivalent to prefixIndex(addr, 8).
 func hostIndex(addr uint8) int {
 	return int(addr) + 1<<8
+}
+
+var hostMasks = []uint8{
+	0b1111_1111,
+	0b0111_1111,
+	0b0011_1111,
+	0b0001_1111,
+	0b0000_1111,
+	0b0000_0111,
+	0b0000_0011,
+	0b0000_0001,
+	0b0000_0000,
+}
+
+// lastHostIndexOfPrefix returns the array index of the last address
+// in addr/len.
+func lastHostIndexOfPrefix(addr uint8, len int) int {
+	return hostIndex(addr | hostMasks[len])
 }
 
 // inversePrefixIndex returns the address and prefix length of idx. It is the
