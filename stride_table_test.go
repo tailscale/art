@@ -41,6 +41,27 @@ func TestHostIndex(t *testing.T) {
 	}
 }
 
+func TestLastHostIndexOfPrefix(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		addr      uint8
+		prefixLen int
+		wantAddr  uint8
+	}{
+		{0, 0, 0xFF},
+		{0, 1, 0x7F},
+		{0x40, 4, 0x4F},
+		{0x0, 8, 0x0},
+	}
+
+	for _, tt := range tests {
+		want := hostIndex(tt.wantAddr)
+		if got := lastHostIndexOfPrefix(tt.addr, tt.prefixLen); got != want {
+			t.Errorf("lastHostIndexOfPrefix(0x%02x, %d) = 0x%02x, want 0x%02x", tt.addr, tt.prefixLen, got, want)
+		}
+	}
+}
+
 func TestStrideTableInsert(t *testing.T) {
 	t.Parallel()
 	// Verify that strideTable's lookup results after a bunch of inserts exactly
@@ -214,6 +235,28 @@ func TestStrideTableDeleteShuffle(t *testing.T) {
 	}
 }
 
+func TestStrideTableOverlaps(t *testing.T) {
+	t.Parallel()
+
+	pfxs := shufflePrefixes(allPrefixes())[:100]
+	slow := slowTable[int]{pfxs}
+	fast := strideTable[int]{}
+
+	for _, pfx := range pfxs {
+		fast.insert(pfx.addr, pfx.len, pfx.val)
+	}
+
+	t.Logf("%s", fast.tableDebugString())
+
+	for _, tt := range allPrefixes() {
+		slowOK := slow.overlapsPrefix(tt.addr, tt.len)
+		fastOK := fast.overlapsPrefix(tt.addr, tt.len)
+		if slowOK != fastOK {
+			t.Fatalf("strideTable.overlapsPrefix(%d, %d) = %v, want %v", tt.addr, tt.len, fastOK, slowOK)
+		}
+	}
+}
+
 var strideRouteCount = []int{10, 50, 100, 200}
 
 // forCountAndOrdering runs the benchmark fn with different sets of routes.
@@ -374,6 +417,20 @@ func (t *slowTable[T]) get(addr uint8) (ret T, ok bool) {
 		}
 	}
 	return ret, curLen != -1
+}
+
+func (t *slowTable[T]) overlapsPrefix(addr uint8, prefixLen int) bool {
+	for _, e := range t.prefixes {
+		minBits := prefixLen
+		if e.len < minBits {
+			minBits = e.len
+		}
+		mask := ^hostMasks[minBits]
+		if addr&mask == e.addr&mask {
+			return true
+		}
+	}
+	return false
 }
 
 func pfxMask(pfxLen int) uint8 {

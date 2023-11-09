@@ -486,6 +486,85 @@ func (t *Table[T]) Delete(pfx netip.Prefix) {
 	}
 }
 
+// OverlapsPrefix reports whether any IP in pfx matches a route in the
+// table.
+func (t *Table[T]) OverlapsPrefix(pfx netip.Prefix) bool {
+	// Single IPs can be checked faster with Get.
+	if pfx.IsSingleIP() {
+		_, ok := t.Get(pfx.Addr())
+		return ok
+	}
+
+	t.init()
+
+	pfx = pfx.Masked()
+	st := t.tableForAddr(pfx.Addr())
+
+	// Similar to other methods, handle the default route specially so
+	// that the rest of the algorithm doesn't have to wrestle with
+	// off-by-one error. Plus, the overlap check for the default route
+	// is trivial.
+	if pfx.Bits() == 0 && (st.routeRefs > 0 || st.childRefs > 0) {
+		return true
+	}
+
+	rawAddr := pfx.Addr().As16()
+	bs := rawAddr[:]
+	if pfx.Addr().Is4() {
+		bs = bs[12:]
+	}
+
+	byteIdx := 0
+	numBits := pfx.Bits()
+	for {
+		if !prefixContains(st.prefix, pfx) {
+			// Path compression has led us off the strideTable path
+			// that would contain some overlapping prefix. There is no
+			// overlap, we're done.
+			//
+			// We could choose to do the same optimization as in Get
+			// here, and not check the strideTable prefixes until
+			// we've finished descending through all the
+			// tables. However, when looking for prefix overlaps, it's
+			// more likely that we'll find a short-cutting answer
+			// early in the tree descent, and doing the check during
+			// descent simplifies the code. Contrast this to Get,
+			// where we're searching for a maximally long prefix
+			// (which is what individual addresses are), so the answer
+			// we're looking for is almost certainly at the bottom of
+			// the tree, with a few exceptions caused by path
+			// compression.
+			return false
+		}
+		if numBits <= 8 {
+			// Reached the end of the prefix, do the final overlap
+			// check on the remaining bits.
+			finalByteIdx := (pfx.Bits() - 1) / 8
+			finalBits := pfx.Bits() - (finalByteIdx * 8)
+			return st.overlapsPrefix(bs[finalByteIdx], finalBits)
+		}
+
+		// Still in the middle of the prefix. Any match at this stage
+		// means that some route exists which overlaps pfx, so we can
+		// cut short. Otherwise, we have to keep descending through
+		// child tables.
+		_, hasRoute, child := st.getValAndChild(bs[byteIdx])
+		if hasRoute {
+			return true
+		}
+
+		if child == nil {
+			// Ran out of children to explore, there can't be an
+			// overlap.
+			return false
+		}
+
+		st = child
+		byteIdx = st.prefix.Bits() / 8
+		numBits = pfx.Bits() - child.prefix.Bits()
+	}
+}
+
 // debugSummary prints the tree of allocated strideTables in t, with each
 // strideTable's refcount.
 func (t *Table[T]) debugSummary() string {
@@ -509,6 +588,12 @@ func strideSummary[T any](w io.Writer, st *strideTable[T], indent int) {
 		fmt.Fprintf(w, "%s%d/8 (%02x/8): ", strings.Repeat(" ", indent), addr, addr)
 		strideSummary(w, child, indent)
 	}
+}
+
+// prefixContains reports whether child is a prefix within parent, or
+// is equal to parent.
+func prefixContains(parent, child netip.Prefix) bool {
+	return parent.Overlaps(child) && parent.Bits() <= child.Bits()
 }
 
 // prefixStrictlyContains reports whether child is a prefix within
