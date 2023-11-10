@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	debugInsert = false
-	debugDelete = false
+	debugInsert   = false
+	debugDelete   = false
+	debugOverlaps = false
 )
 
 // Table is an IPv4 and IPv6 routing table.
@@ -562,6 +563,166 @@ func (t *Table[T]) OverlapsPrefix(pfx netip.Prefix) bool {
 		st = child
 		byteIdx = st.prefix.Bits() / 8
 		numBits = pfx.Bits() - child.prefix.Bits()
+	}
+}
+
+func (t *Table[T]) Overlaps(o *Table[T]) bool {
+	if debugOverlaps {
+		fmt.Printf("Overlaps start\n")
+	}
+	return overlapsSameStride(&t.v4, &o.v4) || overlapsSameStride(&t.v6, &o.v6)
+}
+
+func overlapsSameStride[T any](t, o *strideTable[T]) bool {
+	if debugOverlaps {
+		fmt.Printf("overlapsSameStride %s %s\n", t.prefix, o.prefix)
+		defer fmt.Printf("exit: overlapsSameStride %s %s\n", t.prefix, o.prefix)
+	}
+
+	if t.entriesOverlap(o) {
+		return true
+	}
+
+	for i := 0; i < 256; i++ {
+		_, troute, tchild := t.getValAndChild(uint8(i))
+		_, oroute, ochild := o.getValAndChild(uint8(i))
+
+		// Compare each host slot in t and o. Slots can overlap in a
+		// variety of ways as the route entries and child tables
+		// combine:
+		switch {
+		case troute && oroute:
+			// Easy overlap of route entries.
+			if debugOverlaps {
+				fmt.Printf("%d: stride entries overlap\n", i)
+			}
+			return true
+		case troute && ochild != nil:
+			// no immediate route in o, but o has child prefixes at a
+			// place where t has a route. They must overlap somewhere
+			// within ochild's subtree.
+			if debugOverlaps {
+				fmt.Printf("%d: left route overlaps with right child\n", i)
+			}
+			return true
+		case oroute && tchild != nil:
+			// Same but in reverse, with tchild having the overlapping
+			// subtree.
+			if debugOverlaps {
+				fmt.Printf("%d: left child overlaps with right route\n", i)
+			}
+			return true
+		case tchild == nil && ochild == nil:
+			// No children to explore here, we can just keep iterating.
+			continue
+		case tchild == nil || ochild == nil:
+			// one child but no counterpart in the other tree, no overlap
+			// can come from here.
+			continue
+		case tchild.prefix == ochild.prefix:
+			// The trees at this location are identical in t and
+			// o. Descend and check, exiting early if this subtree
+			// shows an overlap.
+			if debugOverlaps {
+				fmt.Printf("%d: children are same stride\n", i)
+			}
+			if overlapsSameStride(tchild, ochild) {
+				return true
+			}
+			continue
+		case prefixStrictlyContains(tchild.prefix, ochild.prefix):
+			// Path compression has made the subtrees diverge, but tchild
+			// is a parent of ochild. Descend and check, using the
+			// parent/child aware logic.
+			if debugOverlaps {
+				fmt.Printf("%d: left child is parent of right child\n", i)
+			}
+			if overlapsParentChild(tchild, ochild) {
+				return true
+			}
+			continue
+		case prefixStrictlyContains(ochild.prefix, tchild.prefix):
+			// Same, but in reverse, ochild is the parent.
+			if debugOverlaps {
+				fmt.Printf("%d: right child is parent of left child\n", i)
+			}
+			if overlapsParentChild(ochild, tchild) {
+				return true
+			}
+			continue
+		default:
+			// tchild and ochild both exist, but refer to disjoin subtrees
+			// due to path compression. This subtree does not represent an
+			// overlap.
+			continue
+		}
+	}
+	return false
+}
+
+func overlapsParentChild[T any](t, o *strideTable[T]) bool {
+	if debugOverlaps {
+		fmt.Printf("overlapsParentChild parent=%s child=%s\n", t.prefix, o.prefix)
+		defer fmt.Printf("exit: overlapsParentChild parent=%s child=%s\n", t.prefix, o.prefix)
+	}
+	// t is definitely a parent of o, so we have at least 8 bits of
+	// prefix between t and o that we can use to find the correct
+	// child entry and pointer.
+	nextByte := t.prefix.Bits() / 8
+	var addr uint8
+	if o.prefix.Addr().Is4() {
+		addr = o.prefix.Addr().As4()[nextByte]
+	} else {
+		addr = o.prefix.Addr().As16()[nextByte]
+	}
+	if debugOverlaps {
+		fmt.Printf("child byte lookup: %d\n", addr)
+	}
+
+	_, hasRoute, tc := t.getValAndChild(addr)
+
+	switch {
+	case hasRoute:
+		// t has a route covering o, they must overlap.
+		if debugOverlaps {
+			fmt.Printf("parent has route that covers child\n")
+		}
+		return true
+	case tc == nil:
+		// t has no route itself (previous case), and no child
+		// corresponding to o. No overlap possible.
+		if debugOverlaps {
+			fmt.Printf("parent has no route or relevant child\n")
+		}
+		return false
+	case tc.prefix == o.prefix:
+		// The two prefix trees have resynchronized, can go back to
+		// exploring them with the main comparison logic.
+		if debugOverlaps {
+			fmt.Printf("parent and child resynced at %s, continue\n", tc.prefix)
+		}
+		return overlapsSameStride(tc, o)
+	case prefixStrictlyContains(tc.prefix, o.prefix):
+		// t's child is still a parent of o. Keep descending with this
+		// logic.
+		if debugOverlaps {
+			fmt.Printf("parent.child=%s still above child=%s, descend\n", tc.prefix, o.prefix)
+		}
+		return overlapsParentChild(tc, o)
+	case prefixStrictlyContains(o.prefix, tc.prefix):
+		// t's child jumped over o, o is now the parent. Still use
+		// this logic, but swap the parent/child relationship.
+		if debugOverlaps {
+			fmt.Printf("child=%s now above parent.child=%s, swap and descend\n", o.prefix, tc.prefix)
+		}
+		return overlapsParentChild(o, tc)
+	default:
+		// t's child and o represent disjoint subtrees, no overlap
+		// possible.
+		if debugOverlaps {
+			fmt.Printf("parent.child=%s has diverged from child=%s, no overlap\n", tc.prefix, o.prefix)
+		}
+		return false
 	}
 }
 
