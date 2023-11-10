@@ -235,7 +235,7 @@ func TestStrideTableDeleteShuffle(t *testing.T) {
 	}
 }
 
-func TestStrideTableOverlaps(t *testing.T) {
+func TestStrideTableOverlapsPrefix(t *testing.T) {
 	t.Parallel()
 
 	pfxs := shufflePrefixes(allPrefixes())[:100]
@@ -254,6 +254,45 @@ func TestStrideTableOverlaps(t *testing.T) {
 		if slowOK != fastOK {
 			t.Fatalf("strideTable.overlapsPrefix(%d, %d) = %v, want %v", tt.addr, tt.len, fastOK, slowOK)
 		}
+	}
+}
+
+func TestStrideTableOverlaps(t *testing.T) {
+	t.Parallel()
+
+	// Empirically, between 5 and 6 routes per table results in ~50%
+	// of random pairs overlapping. Cool example of the birthday
+	// paradox!
+	const numEntries = 6
+	all := allPrefixes()
+
+	seenResult := map[bool]int{}
+	for i := 0; i < 100_000; i++ {
+		shufflePrefixes(all)
+		pfxs := all[:numEntries]
+		slow := slowTable[int]{pfxs}
+		fast := strideTable[int]{}
+		for _, pfx := range pfxs {
+			fast.insert(pfx.addr, pfx.len, pfx.val)
+		}
+
+		inter := all[numEntries : 2*numEntries]
+		slowInter := slowTable[int]{inter}
+		fastInter := strideTable[int]{}
+		for _, pfx := range inter {
+			fastInter.insert(pfx.addr, pfx.len, pfx.val)
+		}
+
+		gotSlow := slow.overlaps(&slowInter)
+		gotFast := fast.entriesOverlap(&fastInter)
+		if gotSlow != gotFast {
+			t.Fatalf("strideTable.entriesOverlap = %v, want %v\n\nbase:\n%s\n\nintersector:\n%s", gotFast, gotSlow, fast.tableDebugString(), fastInter.tableDebugString())
+		}
+		seenResult[gotFast]++
+	}
+	t.Log(seenResult)
+	if len(seenResult) != 2 { // saw both intersections and non-intersections
+		t.Fatalf("didn't see both intersections and non-intersections\nIntersects: %d\nNon-intersects: %d", seenResult[true], seenResult[false])
 	}
 }
 
@@ -428,6 +467,21 @@ func (t *slowTable[T]) overlapsPrefix(addr uint8, prefixLen int) bool {
 		mask := ^hostMasks[minBits]
 		if addr&mask == e.addr&mask {
 			return true
+		}
+	}
+	return false
+}
+
+func (t *slowTable[T]) overlaps(o *slowTable[T]) bool {
+	for _, tp := range t.prefixes {
+		for _, op := range o.prefixes {
+			minBits := tp.len
+			if op.len < minBits {
+				minBits = op.len
+			}
+			if tp.addr&pfxMask(minBits) == op.addr&pfxMask(minBits) {
+				return true
+			}
 		}
 	}
 	return false

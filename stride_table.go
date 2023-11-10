@@ -223,6 +223,16 @@ func (t *strideTable[T]) getValAndChild(addr uint8) (val T, valOK bool, child *s
 	return
 }
 
+func (t *strideTable[T]) entriesOverlap(o *strideTable[T]) bool {
+	for i := firstHostIndex; i <= lastHostIndex; i++ {
+		if t.entries[i] != nil && o.entries[i] != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
 // overlapsPrefix reports whether the route addr/prefixLen overlaps
 // with any prefix in t.
 func (t *strideTable[T]) overlapsPrefix(addr uint8, prefixLen int) bool {

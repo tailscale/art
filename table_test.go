@@ -9,9 +9,13 @@ import (
 	"math/rand"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"go4.org/netipx"
 )
 
 func TestRegression(t *testing.T) {
@@ -60,6 +64,55 @@ func TestRegression(t *testing.T) {
 			t.Errorf("Get(%q) is insertion order dependent: t1=(%v, %v), t2=(%v, %v)", a, got1, ok1, got2, ok2)
 		}
 	})
+
+	t.Run("overlaps_divergent_children_with_parent_route_entry", func(t *testing.T) {
+		t1, t2 := Table[int]{}, Table[int]{}
+		p := netip.MustParsePrefix
+
+		t1.Insert(p("128.0.0.0/2"), 1)
+		t1.Insert(p("99.173.128.0/17"), 1)
+		t1.Insert(p("219.150.142.0/23"), 1)
+		t1.Insert(p("164.148.190.250/31"), 1)
+		t1.Insert(p("48.136.229.233/32"), 1)
+
+		t2.Insert(p("217.32.0.0/11"), 1)
+		t2.Insert(p("38.176.0.0/12"), 1)
+		t2.Insert(p("106.16.0.0/13"), 1)
+		t2.Insert(p("164.85.192.0/23"), 1)
+		t2.Insert(p("225.71.164.112/31"), 1)
+
+		t.Log(t1.debugSummary())
+		t.Log(t2.debugSummary())
+
+		if !t1.Overlaps(&t2) {
+			t.Fatalf("tables unexpectedly do not overlap")
+		}
+	})
+
+	t.Run("overlaps_parent_child_comparison_with_route_in_parent", func(t *testing.T) {
+		t1, t2 := Table[int]{}, Table[int]{}
+		p := netip.MustParsePrefix
+
+		t1.Insert(p("226.0.0.0/8"), 1)
+		t1.Insert(p("81.128.0.0/9"), 1)
+		t1.Insert(p("152.0.0.0/9"), 1)
+		t1.Insert(p("151.220.0.0/16"), 1)
+		t1.Insert(p("89.162.61.0/24"), 1)
+
+		t2.Insert(p("54.0.0.0/9"), 1)
+		t2.Insert(p("35.89.128.0/19"), 1)
+		t2.Insert(p("72.33.53.0/24"), 1)
+		t2.Insert(p("2.233.60.32/27"), 1)
+		t2.Insert(p("152.42.142.160/28"), 1)
+
+		t.Log(t1.debugSummary())
+		t.Log(t2.debugSummary())
+
+		if !t1.Overlaps(&t2) {
+			t.Fatalf("tables unexpectedly do not overlap")
+		}
+	})
+
 }
 
 func TestComputePrefixSplit(t *testing.T) {
@@ -867,6 +920,43 @@ func TestOverlapsPrefixCompare(t *testing.T) {
 	}
 }
 
+func TestOverlapsCompare(t *testing.T) {
+	t.Parallel()
+
+	// Empirically, between 5 and 6 routes per table results in ~50%
+	// of random pairs overlapping. Cool example of the birthday
+	// paradox!
+	const numEntries = 6
+
+	seen := map[bool]int{}
+	for i := 0; i < 10000; i++ {
+		pfxs := randomPrefixes(numEntries)
+		slow := slowPrefixTable[int]{pfxs}
+		fast := Table[int]{}
+		for _, pfx := range pfxs {
+			fast.Insert(pfx.pfx, pfx.val)
+		}
+
+		inter := randomPrefixes(numEntries)
+		slowInter := slowPrefixTable[int]{inter}
+		fastInter := Table[int]{}
+		for _, pfx := range inter {
+			fastInter.Insert(pfx.pfx, pfx.val)
+		}
+
+		gotSlow := slow.overlaps(&slowInter)
+		gotFast := fast.Overlaps(&fastInter)
+
+		if gotSlow != gotFast {
+			t.Fatalf("Overlaps(...) = %v, want %v\n\nBase:\n%s\n\nIntersect:\n%s", gotFast, gotSlow, slow.String(), slowInter.String())
+		}
+
+		seen[gotFast]++
+	}
+
+	t.Log(seen)
+}
+
 type tableTest struct {
 	// addr is an IP address string to look up in a route table.
 	addr string
@@ -1063,7 +1153,106 @@ func BenchmarkTableOverlapsPrefix(b *testing.B) {
 		elapsed := float64(b.Elapsed().Nanoseconds())
 		elapsedSec := float64(b.Elapsed().Seconds())
 		b.ReportMetric(elapsed/lookups, "ns/op")
-		b.ReportMetric(lookups/elapsedSec, "addrs/s")
+		b.ReportMetric(lookups/elapsedSec, "prefixes/s")
+		b.ReportMetric(allocs/lookups, "allocs/op")
+		b.ReportMetric(bytes/lookups, "B/op")
+	})
+}
+
+func BenchmarkTableOverlaps(b *testing.B) {
+	forFamilyAndCount(b, func(b *testing.B, routes []slowPrefixEntry[int]) {
+		var rt Table[int]
+		for _, route := range routes {
+			rt.Insert(route.pfx, route.val)
+		}
+
+		genPfxs := randomPrefixes4
+		if routes[0].pfx.Addr().Is6() {
+			genPfxs = randomPrefixes6
+		}
+
+		const (
+			intersectSize = 10
+			numIntersects = 1_000
+		)
+
+		intersects := make([]*Table[int], numIntersects)
+		for i := range intersects {
+			inter := &Table[int]{}
+			for _, route := range genPfxs(intersectSize) {
+				inter.Insert(route.pfx, route.val)
+			}
+			intersects[i] = inter
+		}
+
+		var t runningTimer
+		allocs, bytes := getMemCost(func() {
+			for i := 0; i < b.N; i++ {
+				t.Start()
+				boolSink = rt.Overlaps(intersects[i%numIntersects])
+				t.Stop()
+			}
+		})
+
+		b.ReportAllocs() // Enables the output, but we report manually below
+		lookups := float64(b.N)
+		elapsed := float64(t.Elapsed().Nanoseconds())
+		elapsedSec := t.Elapsed().Seconds()
+		b.ReportMetric(elapsed/lookups, "ns/op")
+		b.ReportMetric(lookups/elapsedSec, "tables/s")
+		b.ReportMetric(allocs/lookups, "allocs/op")
+		b.ReportMetric(bytes/lookups, "B/op")
+	})
+}
+
+func BenchmarkIPSetOverlaps(b *testing.B) {
+	forFamilyAndCount(b, func(b *testing.B, routes []slowPrefixEntry[int]) {
+		var rtb netipx.IPSetBuilder
+		for _, route := range routes {
+			rtb.AddPrefix(route.pfx)
+		}
+		rt, err := rtb.IPSet()
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		genPfxs := randomPrefixes4
+		if routes[0].pfx.Addr().Is6() {
+			genPfxs = randomPrefixes6
+		}
+
+		const (
+			intersectSize = 10
+			numIntersects = 1_000
+		)
+
+		intersects := make([]*netipx.IPSet, numIntersects)
+		for i := range intersects {
+			interb := netipx.IPSetBuilder{}
+			for _, route := range genPfxs(intersectSize) {
+				interb.AddPrefix(route.pfx)
+			}
+			intersects[i], err = interb.IPSet()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		var t runningTimer
+		allocs, bytes := getMemCost(func() {
+			for i := 0; i < b.N; i++ {
+				t.Start()
+				boolSink = rt.Overlaps(intersects[i%numIntersects])
+				t.Stop()
+			}
+		})
+
+		b.ReportAllocs() // Enables the output, but we report manually below
+		lookups := float64(b.N)
+		elapsed := float64(t.Elapsed().Nanoseconds())
+		elapsedSec := t.Elapsed().Seconds()
+		b.ReportMetric(elapsed/lookups, "ns/op")
+		b.ReportMetric(lookups/elapsedSec, "tables/s")
 		b.ReportMetric(allocs/lookups, "allocs/op")
 		b.ReportMetric(bytes/lookups, "B/op")
 	})
@@ -1203,6 +1392,35 @@ func (t *slowPrefixTable[T]) overlapsPrefix(pfx netip.Prefix) bool {
 		}
 	}
 	return false
+}
+
+func (t *slowPrefixTable[T]) overlaps(o *slowPrefixTable[T]) bool {
+	for _, tp := range t.prefixes {
+		for _, op := range o.prefixes {
+			if tp.pfx.Overlaps(op.pfx) {
+				if debugOverlaps {
+					fmt.Printf("slow overlap: found with %s and %s\n", tp.pfx, op.pfx)
+				}
+				return true
+			}
+		}
+	}
+	if debugOverlaps {
+		fmt.Printf("slow overlap: no overlap found\n")
+	}
+	return false
+}
+
+func (t *slowPrefixTable[T]) String() string {
+	pfxs := append([]slowPrefixEntry[T](nil), t.prefixes...)
+	slices.SortFunc(pfxs, func(a, b slowPrefixEntry[T]) int {
+		return netipx.ComparePrefix(a.pfx, b.pfx)
+	})
+	var ret []string
+	for _, pfx := range pfxs {
+		ret = append(ret, pfx.pfx.String())
+	}
+	return strings.Join(ret, "\n")
 }
 
 // randomPrefixes returns n randomly generated prefixes and associated values,
