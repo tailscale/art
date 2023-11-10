@@ -9,9 +9,13 @@ import (
 	"math/rand"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"go4.org/netipx"
 )
 
 func TestRegression(t *testing.T) {
@@ -60,6 +64,56 @@ func TestRegression(t *testing.T) {
 			t.Errorf("Get(%q) is insertion order dependent: t1=(%v, %v), t2=(%v, %v)", a, got1, ok1, got2, ok2)
 		}
 	})
+
+	t.Run("overlaps_divergent_children_with_parent_route_entry", func(t *testing.T) {
+		t1, t2 := Table[int]{}, Table[int]{}
+		p := netip.MustParsePrefix
+
+		t1.Insert(p("128.0.0.0/2"), 1)
+		t1.Insert(p("99.173.128.0/17"), 1)
+		t1.Insert(p("219.150.142.0/23"), 1)
+		t1.Insert(p("164.148.190.250/31"), 1)
+		t1.Insert(p("48.136.229.233/32"), 1)
+
+		t2.Insert(p("217.32.0.0/11"), 1)
+		t2.Insert(p("38.176.0.0/12"), 1)
+		t2.Insert(p("106.16.0.0/13"), 1)
+		t2.Insert(p("164.85.192.0/23"), 1)
+		t2.Insert(p("225.71.164.112/31"), 1)
+
+		t.Log(t1.debugSummary())
+		t.Log(t2.debugSummary())
+
+		if !t1.Overlaps(&t2) {
+			t.Fatalf("tables unexpectedly do not overlap")
+		}
+	})
+
+	// found with 152.0.0.0/9 and 152.42.142.160/28
+	t.Run("overlaps_2", func(t *testing.T) {
+		t1, t2 := Table[int]{}, Table[int]{}
+		p := netip.MustParsePrefix
+
+		t1.Insert(p("226.0.0.0/8"), 1)
+		t1.Insert(p("81.128.0.0/9"), 1)
+		t1.Insert(p("152.0.0.0/9"), 1)
+		t1.Insert(p("151.220.0.0/16"), 1)
+		t1.Insert(p("89.162.61.0/24"), 1)
+
+		t2.Insert(p("54.0.0.0/9"), 1)
+		t2.Insert(p("35.89.128.0/19"), 1)
+		t2.Insert(p("72.33.53.0/24"), 1)
+		t2.Insert(p("2.233.60.32/27"), 1)
+		t2.Insert(p("152.42.142.160/28"), 1)
+
+		t.Log(t1.debugSummary())
+		t.Log(t2.debugSummary())
+
+		if !t1.Overlaps(&t2) {
+			t.Fatalf("tables unexpectedly do not overlap")
+		}
+	})
+
 }
 
 func TestComputePrefixSplit(t *testing.T) {
@@ -859,12 +913,48 @@ func TestOverlapsPrefixCompare(t *testing.T) {
 
 	tests := randomPrefixes(10_000)
 	for _, tt := range tests {
+		t.Log(tt.pfx)
 		gotSlow := slow.overlapsPrefix(tt.pfx)
 		gotFast := fast.OverlapsPrefix(tt.pfx)
 		if gotSlow != gotFast {
 			t.Fatalf("overlapsPrefix(%q) = %v, want %v", tt.pfx, gotFast, gotSlow)
 		}
 	}
+}
+
+func TestOverlapsCompare(t *testing.T) {
+	t.Parallel()
+
+	seen := map[bool]int{}
+	for i := 0; i < 1000; i++ {
+		pfxs := randomPrefixes(10)
+		slow := slowPrefixTable[int]{pfxs}
+		fast := Table[int]{}
+		for _, pfx := range pfxs {
+			fast.Insert(pfx.pfx, pfx.val)
+		}
+
+		inter := randomPrefixes(10)
+		slowInter := slowPrefixTable[int]{inter}
+		fastInter := Table[int]{}
+		for _, pfx := range inter {
+			fastInter.Insert(pfx.pfx, pfx.val)
+		}
+
+		t.Log(slow.String())
+		t.Log(slowInter.String())
+
+		gotSlow := slow.overlaps(&slowInter)
+		gotFast := fast.Overlaps(&fastInter)
+
+		if gotSlow != gotFast {
+			t.Fatalf("Overlaps(...) = %v, want %v\n\nBase:\n%s\n\nIntersect:\n%s", gotFast, gotSlow, slow.String(), slowInter.String())
+		}
+
+		seen[gotFast]++
+	}
+
+	t.Log(seen)
 }
 
 type tableTest struct {
@@ -1203,6 +1293,35 @@ func (t *slowPrefixTable[T]) overlapsPrefix(pfx netip.Prefix) bool {
 		}
 	}
 	return false
+}
+
+func (t *slowPrefixTable[T]) overlaps(o *slowPrefixTable[T]) bool {
+	for _, tp := range t.prefixes {
+		for _, op := range o.prefixes {
+			if tp.pfx.Overlaps(op.pfx) {
+				if debugOverlaps {
+					fmt.Printf("slow overlap: found with %s and %s\n", tp.pfx, op.pfx)
+				}
+				return true
+			}
+		}
+	}
+	if debugOverlaps {
+		fmt.Printf("slow overlap: no overlap found\n")
+	}
+	return false
+}
+
+func (t *slowPrefixTable[T]) String() string {
+	pfxs := append([]slowPrefixEntry[T](nil), t.prefixes...)
+	slices.SortFunc(pfxs, func(a, b slowPrefixEntry[T]) int {
+		return netipx.ComparePrefix(a.pfx, b.pfx)
+	})
+	var ret []string
+	for _, pfx := range pfxs {
+		ret = append(ret, pfx.pfx.String())
+	}
+	return strings.Join(ret, "\n")
 }
 
 // randomPrefixes returns n randomly generated prefixes and associated values,
